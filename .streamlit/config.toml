@@ -1,0 +1,13 @@
+# Dark navy theme (matches ui.png).
+
+[theme]
+base = "dark"
+primaryColor = "#5B6CF9"              # accent: active chat, buttons, pills
+backgroundColor = "#050814"          # main chat panel
+secondaryBackgroundColor = "#0B0F1A" # sidebar, inputs, cards
+textColor = "#E6E8F0"
+font = "'DM Sans':https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&display=swap, sans-serif"
+
+[client]
+showSidebarNavigation = false   # app.py draws its own sidebar
+toolbarMode = "minimal"          # hide the Deploy button

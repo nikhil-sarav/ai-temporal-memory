@@ -1,5 +1,5 @@
 """
-Core memory operations for the AI Agent Temporal Memory Management System.
+Core of the project. Embedding, storing, finding conflicts, retrieving, building the prompt.
 
 Pipeline on every message:
     1. embed()            -> text into a 384-number meaning vector
@@ -11,8 +11,18 @@ Guarantees:
     * exact duplicates are never stored twice (they reinforce instead)
     * ALL contradictory facts are surfaced, not just the closest one
     * superseded facts are kept for history but excluded from retrieval
+
+Database objects used (see db_upgrade.sql):
+    * trigger trg_memory_audit     -> logs every edit/delete to memory_audit
+    * trigger trg_guard_supersede  -> stamps superseded_at, blocks self-supersede
+    * procedure sp_supersede(...)  -> atomic retire + demote (resolve_conflict)
+    * function  fn_memory_stats()  -> dashboard counts (memory_stats)
+    * function  fn_purge_expired() -> retire past-date memories (purge_expired)
+    * column    source_message_id  -> provenance link back to messages
 """
 
+import re
+from datetime import datetime, timezone
 from sentence_transformers import SentenceTransformer
 from db import get_conn
 
@@ -25,7 +35,9 @@ except Exception:      # dateparser optional; manual valid_until still works
 _model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # --- tuning knobs (explain these in your report) ---
-CONFLICT_THRESHOLD = 0.60   # above this similarity = probably about the SAME fact
+CONFLICT_THRESHOLD = 0.50   # above this similarity = probably about the SAME fact
+PREFIX_WORDS       = 3      # same opening words ("i live in") = same attribute...
+PREFIX_FLOOR       = 0.30   # ...flagged as a conflict even at this lower similarity
 MIN_SIMILARITY     = 0.25   # below this = unrelated, don't retrieve at all
 
 # retrieval score weights: similarity, priority, recency-of-creation, event-urgency
@@ -44,18 +56,25 @@ def _to_pgvector(vec):
 
 
 # ---------- MESSAGES (raw conversation log) ----------
-def log_message(agent_id, role, content):
-    """CREATE: append one turn to the conversation log."""
+def log_message(agent_id, role, content, conversation_id=None):
+    """CREATE: append one turn to the log. Returns the new message_id.
+    conversation_id links the turn to a specific chat thread."""
     priority = detect_priority(content)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO messages (agent_id, role, content, priority)
-                   VALUES (%s, %s, %s, %s)""",
-                (agent_id, role, content, priority),
+                """INSERT INTO messages (agent_id, role, content, priority, conversation_id)
+                   VALUES (%s, %s, %s, %s, %s)
+                   RETURNING message_id""",
+                (agent_id, role, content, priority, conversation_id),
             )
+            new_id = cur.fetchone()[0]
+            if conversation_id is not None:
+                cur.execute("UPDATE conversations SET updated_at = now() "
+                            "WHERE conversation_id = %s", (conversation_id,))
         conn.commit()
+        return new_id
     finally:
         conn.close()
 
@@ -82,7 +101,7 @@ def list_memories(agent_id, include_superseded=False):
     """READ: every memory visible to this agent (private + shared)."""
     sql = """
         SELECT memory_id, scope, content, priority, access_count,
-               created_at, superseded, valid_until
+               created_at, superseded, valid_until, source_message_id
         FROM memories
         WHERE (scope = 'shared' OR agent_id = %s)
     """
@@ -99,7 +118,8 @@ def list_memories(agent_id, include_superseded=False):
 
 
 def update_memory(memory_id, content=None, priority=None, valid_until=..., clear_expiry=False):
-    """UPDATE: edit a memory's text, priority, and/or expiry. Re-embeds if text changed."""
+    """UPDATE: edit a memory's text, priority, and/or expiry. Re-embeds if text changed.
+    Any content/priority change here is captured automatically by trg_memory_audit."""
     sets, params = [], []
     if content is not None:
         sets.append("content = %s"); params.append(content)
@@ -110,6 +130,14 @@ def update_memory(memory_id, content=None, priority=None, valid_until=..., clear
         sets.append("valid_until = NULL")
     elif valid_until is not ...:
         sets.append("valid_until = %s"); params.append(valid_until)
+    if clear_expiry or (valid_until not in (..., None)
+                        and valid_until > datetime.now(timezone.utc)):
+        # Extending the expiry restores a memory that fn_purge_expired retired
+        # (retired with no replacement while its OLD valid_until had passed).
+        # SET expressions read the old row, so this checks the old expiry.
+        sets.append("""superseded = CASE
+                           WHEN superseded_by IS NULL AND valid_until <= now() THEN FALSE
+                           ELSE superseded END""")
     if not sets:
         return
     params.append(memory_id)
@@ -123,7 +151,7 @@ def update_memory(memory_id, content=None, priority=None, valid_until=..., clear
 
 
 def delete_memory(memory_id):
-    """DELETE: permanently remove one memory row."""
+    """DELETE: permanently remove one memory row (still recorded in memory_audit)."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -132,6 +160,27 @@ def delete_memory(memory_id):
                         (memory_id,))
             cur.execute("DELETE FROM memories WHERE memory_id = %s", (memory_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------- AUDIT LOG (read the trigger-written history) ----------
+def list_audit(agent_id=None, limit=100):
+    """READ the memory_audit table (written automatically by trg_memory_audit)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            base = """SELECT audit_id, memory_id, operation,
+                             old_content, new_content,
+                             old_priority, new_priority, changed_at
+                      FROM memory_audit """
+            if agent_id is None:
+                cur.execute(base + "ORDER BY changed_at DESC LIMIT %s", (limit,))
+            else:
+                cur.execute(base + "WHERE agent_id = %s OR agent_id IS NULL "
+                                    "ORDER BY changed_at DESC LIMIT %s",
+                            (agent_id, limit))
+            return cur.fetchall()
     finally:
         conn.close()
 
@@ -178,7 +227,13 @@ def delete_agent(agent_id):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE memories SET superseded_by = NULL WHERE agent_id = %s", (agent_id,))
+            # Null out any superseded_by references that point at THIS agent's
+            # memories, so the self-FK doesn't block the delete. (Fixed to match
+            # on the memories being removed, not on the agent_id.)
+            cur.execute(
+                """UPDATE memories SET superseded_by = NULL
+                   WHERE superseded_by IN (SELECT memory_id FROM memories WHERE agent_id = %s)""",
+                (agent_id,))
             cur.execute("DELETE FROM memories WHERE agent_id = %s", (agent_id,))
             cur.execute("DELETE FROM messages WHERE agent_id = %s", (agent_id,))
             cur.execute("DELETE FROM agents WHERE agent_id = %s", (agent_id,))
@@ -225,42 +280,6 @@ def detect_priority(text):
     return 1
 
 
-# ---------- DUPLICATE HANDLING ----------
-def find_duplicate(agent_id, content):
-    """Return memory_id of an identical active memory, or None."""
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT memory_id FROM memories
-                   WHERE (scope = 'shared' OR agent_id = %s)
-                     AND superseded = FALSE
-                     AND lower(btrim(content)) = lower(btrim(%s))
-                   LIMIT 1""",
-                (agent_id, content),
-            )
-            row = cur.fetchone()
-            return row[0] if row else None
-    finally:
-        conn.close()
-
-
-def reinforce(memory_id):
-    """Re-stating a fact strengthens it instead of duplicating the row."""
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """UPDATE memories
-                   SET access_count = access_count + 1, last_accessed = NOW()
-                   WHERE memory_id = %s""",
-                (memory_id,),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 # ---------- CONFLICT DETECTION ----------
 def find_conflicts(agent_id, content):
     """
@@ -270,29 +289,49 @@ def find_conflicts(agent_id, content):
     Returning all of them (not just the closest) means that when the user says
     "it changed", every stale version is superseded in one go, so contradictions
     cannot silently accumulate.
+
+    Similarity alone misses value swaps: "I live in Trivandrum" vs "I live in
+    Mumbai now" scores only ~0.36, because the embedding is dominated by the
+    place name. So a memory also counts as a conflict when it opens with the
+    same PREFIX_WORDS words (same subject + verb, i.e. the same attribute)
+    and is at least loosely related (PREFIX_FLOOR).
     """
     vec = _to_pgvector(embed(content))
     sql = """
-        SELECT memory_id, content, (1 - (embedding <=> %s::vector)) AS similarity
+        SELECT memory_id, content, (1 - (embedding <=> %(vec)s::vector)) AS similarity
         FROM memories
-        WHERE (scope = 'shared' OR agent_id = %s)
+        WHERE (scope = 'shared' OR agent_id = %(agent)s)
           AND superseded = FALSE
           AND (valid_until IS NULL OR valid_until > NOW())
           AND embedding IS NOT NULL
-          AND lower(btrim(content)) <> lower(btrim(%s))
-          AND (1 - (embedding <=> %s::vector)) > %s
+          AND lower(btrim(content)) <> lower(btrim(%(text)s))
+          AND (   (1 - (embedding <=> %(vec)s::vector)) > %(threshold)s
+               OR (    (1 - (embedding <=> %(vec)s::vector)) > %(floor)s
+                   AND (regexp_split_to_array(lower(btrim(content)), '[[:space:]]+'))[1:%(n)s]
+                     = (regexp_split_to_array(lower(btrim(%(text)s)), '[[:space:]]+'))[1:%(n)s]))
         ORDER BY similarity DESC
     """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (vec, agent_id, content, vec, CONFLICT_THRESHOLD))
+            cur.execute(sql, {"vec": vec, "agent": agent_id, "text": content,
+                              "threshold": CONFLICT_THRESHOLD,
+                              "floor": PREFIX_FLOOR, "n": PREFIX_WORDS})
             return cur.fetchall()
     finally:
         conn.close()
 
 
 # ---------- EXPIRY (valid-time) ----------
+_MONTH = r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b"
+_REAL_DATE = re.compile(
+    rf"\d.*{_MONTH}|{_MONTH}\.?\s*\d"            # 20 November 2026 / Nov 20
+    r"|\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}"          # 20/11/2026, 2026-11-20
+    r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|\btomorrow\b",
+    re.IGNORECASE,
+)
+
+
 def extract_expiry(text):
     """
     Find a future date mentioned in the text and return it as the memory's
@@ -308,86 +347,96 @@ def extract_expiry(text):
         )
     except Exception:
         return None
+    # dateparser also reads plain words as dates ("now", "on", "may",
+    # "am 21 years"), which gave facts like "I live in Pune now" an expiry of
+    # tonight. Only trust matches that actually name a calendar day.
+    found = [(s, dt) for s, dt in (found or []) if _REAL_DATE.search(s)]
     if not found:
         return None
-    # use the latest date mentioned, valid through the end of that day
+    # use the latest date mentioned, valid through the end of that day.
+    # dateparser returns a naive local time; .astimezone() attaches the local
+    # zone so the TIMESTAMPTZ column stores the right instant.
     latest = max(dt for _, dt in found)
-    return latest.replace(hour=23, minute=59, second=59, microsecond=0)
+    return latest.replace(hour=23, minute=59, second=59, microsecond=0).astimezone()
 
 
 # ---------- STORE ----------
-def store_memory(content, agent_id, scope="private"):
+def _store(cur, content, agent_id, scope, source_message_id):
     """
-    Save a memory. If an identical one already exists, reinforce it instead of
-    inserting a duplicate. Returns (memory_id, was_duplicate).
+    Save a memory using the caller's cursor (so it can share a transaction).
+    If an identical active one exists, reinforce it instead of inserting a
+    duplicate — re-stating a fact strengthens it. (Reinforcing only bumps
+    access_count/last_accessed, so trg_memory_audit ignores it.)
+    Returns (memory_id, was_duplicate).
     """
-    dup = find_duplicate(agent_id, content)
-    if dup:
-        reinforce(dup)
-        return dup, True
+    cur.execute(
+        """SELECT memory_id FROM memories
+           WHERE (scope = 'shared' OR agent_id = %s)
+             AND superseded = FALSE
+             AND lower(btrim(content)) = lower(btrim(%s))
+           LIMIT 1""",
+        (agent_id, content),
+    )
+    row = cur.fetchone()
+    if row:
+        cur.execute(
+            """UPDATE memories
+               SET access_count = access_count + 1, last_accessed = NOW()
+               WHERE memory_id = %s""",
+            (row[0],),
+        )
+        return row[0], True
 
     vec = _to_pgvector(embed(content))
     aid = None if scope == "shared" else agent_id   # shared memories have NULL agent_id
-    priority = detect_priority(content)
-    valid_until = extract_expiry(content)           # auto-detected date, or None
+    cur.execute(
+        """INSERT INTO memories
+               (agent_id, scope, content, priority, embedding, valid_until, source_message_id)
+           VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
+           RETURNING memory_id""",
+        (aid, scope, content, detect_priority(content), vec,
+         extract_expiry(content), source_message_id),
+    )
+    return cur.fetchone()[0], False
+
+
+def store_memory(content, agent_id, scope="private", source_message_id=None):
+    """Save a memory (deduplicated). Returns (memory_id, was_duplicate).
+    source_message_id: the messages.message_id this fact came from (provenance)."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO memories (agent_id, scope, content, priority, embedding, valid_until)
-                   VALUES (%s, %s, %s, %s, %s::vector, %s)
-                   RETURNING memory_id""",
-                (aid, scope, content, priority, vec, valid_until),
-            )
-            new_id = cur.fetchone()[0]
+            result = _store(cur, content, agent_id, scope, source_message_id)
         conn.commit()
-        return new_id, False
+        return result
     finally:
         conn.close()
 
 
-# ---------- SUPERSEDE (memory versioning) ----------
-def supersede_many(old_ids, new_id=None):
+# ---------- SUPERSEDE (memory versioning, via stored procedure) ----------
+def resolve_conflict(content, agent_id, scope, source_message_id,
+                     retire_ids, keep_ids, save_new=True):
     """
-    Mark outdated facts as replaced. Rows are KEPT (so the version history is
-    auditable) but excluded from all future retrieval.
+    Resolve a conflict in ONE transaction:
+        * save_new    -> store the new message as a memory (False = cancellation)
+        * retire_ids  -> marked superseded by it (kept for history, dropped from retrieval)
+        * keep_ids    -> 'both are true': kept but demoted below the new fact
 
-    new_id may be None: a fact can be retired without a replacement, e.g. when
-    an event is cancelled rather than rescheduled.
+    The INSERT and the CALL sp_supersede share a single commit, so a failure
+    rolls back both — the store can never end up holding the new fact AND
+    the old one it was meant to replace. superseded_at is filled in by the
+    trg_guard_supersede trigger.
     """
-    if not old_ids:
-        return
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """UPDATE memories
-                   SET superseded = TRUE,
-                       superseded_by = %s,
-                       superseded_at = NOW(),
-                       priority = 1
-                   WHERE memory_id = ANY(%s)""",
-                (new_id, list(old_ids)),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def demote_many(old_ids):
-    """
-    'Both are true' option: keep older facts active but drop their priority so
-    the newest one always outranks them in retrieval.
-    """
-    if not old_ids:
-        return
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE memories SET priority = GREATEST(priority - 2, 1) WHERE memory_id = ANY(%s)",
-                (list(old_ids),),
-            )
+            new_id = None
+            if save_new:
+                new_id, _ = _store(cur, content, agent_id, scope, source_message_id)
+            demote_ids = keep_ids if new_id else None   # nothing new to rank below
+            if retire_ids or demote_ids:
+                cur.execute("CALL sp_supersede(%s, %s, %s)",
+                            (retire_ids or None, new_id, demote_ids or None))
         conn.commit()
     finally:
         conn.close()
@@ -411,9 +460,24 @@ def version_history():
 
 
 # ---------- HOUSEKEEPING ----------
+def purge_expired():
+    """Retire every past-date memory in one shot via fn_purge_expired(). Returns count."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT fn_purge_expired()")
+            n = cur.fetchone()[0]
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
 def clear_data(include_messages=True):
-    """Wipe stored memories (and optionally the chat log) and restart IDs at 1."""
-    target = "memories, messages" if include_messages else "memories"
+    """Wipe stored memories + audit log (and optionally the chat log) and restart IDs at 1."""
+    target = "memories, memory_audit"
+    if include_messages:
+        target += ", messages, conversations"
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -424,12 +488,24 @@ def clear_data(include_messages=True):
 
 
 def memory_count():
-    """How many active (non-superseded) memories are stored."""
+    """How many active (non-superseded, non-expired) memories are stored."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM memories WHERE superseded = FALSE AND (valid_until IS NULL OR valid_until > NOW())")
             return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def memory_stats(agent_id):
+    """Dashboard summary via fn_memory_stats():
+       (total_active, total_superseded, total_expired, avg_priority, total_recall)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM fn_memory_stats(%s)", (agent_id,))
+            return cur.fetchone()
     finally:
         conn.close()
 

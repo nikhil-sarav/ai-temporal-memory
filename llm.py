@@ -1,4 +1,6 @@
-"""The LLM that writes the actual replies — Groq."""
+"""
+generate_reply(context) sends one prompt to groq and returns the reply text
+"""
 
 import streamlit as st
 from groq import Groq
